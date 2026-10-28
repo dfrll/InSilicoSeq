@@ -7,6 +7,7 @@ import sys
 
 import _pickle
 import numpy as np
+from itertools import groupby
 from Bio.Seq import MutableSeq, Seq
 
 from iss import util
@@ -111,50 +112,6 @@ class ErrorModel(object):
         record.seq = Seq(mutable_seq)
         return record
 
-    def adjust_seq_length(self, mut_seq, orientation, full_sequence, bounds):
-        """Truncate or Extend reads to make them fit the read length
-
-        When insertions or deletions are introduced to the reads, their length
-        will change. This function takes a (mutable) read and a reference
-        sequence, and extend or truncate the read if it has had an insertion
-        or a deletion
-
-        Args:
-            mut_seq (MutableSeq): a mutable sequence
-            orientation (string): orientation of the read. Can be 'forward' or
-                'reverse'
-            full_sequence (Seq): the reference sequence from which mut_seq
-                comes from
-            bounds (tuple): the position of the read in the full_sequence
-
-        Returns:
-            Seq: a sequence fitting the ErrorModel
-        """
-        read_start, read_end = bounds
-        if len(mut_seq) == self.read_length:
-            return Seq(mut_seq)
-        elif len(mut_seq) > self.read_length:
-            while len(mut_seq) > self.read_length:
-                mut_seq.pop()
-            return Seq(mut_seq)
-        else:  # len smaller
-            to_add = self.read_length - len(mut_seq)
-            if orientation == "forward":
-                for i in range(to_add):
-                    if read_end + i >= len(full_sequence):
-                        nucl_to_add = "A"
-                    else:
-                        nucl_to_add = str(full_sequence[read_end + i])
-                    mut_seq.append(nucl_to_add)
-            elif orientation == "reverse":
-                for i in range(to_add):
-                    if read_start - 1 - i < 0:
-                        nucl_to_add = "A"
-                    else:
-                        nucl_to_add = util.rev_comp(full_sequence[read_start - 1 - i])
-                    mut_seq.append(nucl_to_add)
-            return Seq(mut_seq)
-
     def introduce_indels(self, record, orientation, full_seq, bounds):
         """Introduce insertions or deletions in a sequence
 
@@ -181,48 +138,153 @@ class ErrorModel(object):
         elif orientation == "reverse":
             insertions = self.ins_rev
             deletions = self.del_rev
+        else:
+            raise ValueError(f"Unknown orientation: {orientation}")
 
-        mutable_seq = MutableSeq(record.seq)
-        position = 0
-        for nucl in range(self.read_length - 1):
-            try:
-                # skip ambiguous nucleotides
-                if mutable_seq[nucl].upper() in "RYWSMKHBVDN":
-                    position += 1
-                    continue
-                for nucl_to_insert, prob in insertions[position].items():
-                    if random.random() < prob:
-                        # we want to insert after the base read
-                        mutable_seq.insert(position + 1, str(nucl_to_insert))
-                        if self.store_mutations:
-                            record.annotations["mutations"].append(
-                                {
-                                    "id": record.id,
-                                    "position": position,
-                                    "ref": mutable_seq[position],
-                                    "alt": mutable_seq[position] + nucl_to_insert,
-                                    "quality": ".",
-                                    "type": "ins",
-                                }
-                            )
+        original = str(record.seq)
+        read_start, read_end = bounds
 
-                if random.random() < deletions[position][mutable_seq[nucl].upper()]:
-                    mutable_seq.pop(position)
-                    if self.store_mutations:
-                        record.annotations["mutations"].append(
-                            {
-                                "id": record.id,
-                                "position": position,
-                                "ref": mutable_seq[position],
-                                "alt": ".",
-                                "quality": ".",
-                                "type": "del",
-                            }
-                        )
-                position += 1
-            except IndexError:
+        qualities = record.letter_annotations.get("phred_quality")
+        if qualities is None:
+            raise ValueError(f"{record.id} has no phred_quality scores")
+
+        qualities = list(qualities)
+
+        sequence = []
+        new_qualities = []
+        ops = []
+
+        def add_op(op):
+            ops.append((op, 1))
+
+        for position, base in enumerate(original):
+            ambiguous = base.upper() in "RYWSMKHBVDN"
+
+            deleted = (
+                not ambiguous
+                and position < len(deletions)
+                and random.random() < deletions[position].get(base.upper(), 0)
+            )
+
+            if deleted:
+                add_op(2) # D: consumes reference, not query
+                if self.store_mutations:
+                    record.annotations.setdefault("mutations", []).append({
+                       "id": record.id,
+                       "position": position,
+                       "ref": base,
+                       "alt": ".",
+                       "quality": ".",
+                       "type": "del",
+                    })
                 continue
 
-        seq = self.adjust_seq_length(mutable_seq, orientation, full_seq, bounds)
-        record.seq = seq
-        return record
+            sequence.append(base)
+            add_op(0) # M
+            new_qualities.append(qualities[position])
+
+            if not ambiguous and position < len(insertions):
+                for inserted_base, probability in insertions[position].items():
+                    if random.random() < probability:
+                        inserted_base = str(inserted_base)
+                        sequence.append(inserted_base)
+                        add_op(1) # I
+
+                        new_qualities.append(qualities[position])
+
+                        if self.store_mutations:
+                            record.annotations.setdefault("mutations", []).append({
+                                "id": record.id,
+                                "position": position,
+                                "ref": base,
+                                "alt": base + inserted_base,
+                                "quality": ".",
+                                "type": "ins"
+                            })
+
+        sequence, new_qualities, ops, read_start, read_end = self._adjust_seq_length(
+            sequence, new_qualities, ops, orientation, full_seq,
+            read_start, read_end
+        )
+
+        record.letter_annotations.clear()
+        record.seq = Seq("".join(sequence))
+        record.letter_annotations["phred_quality"] = new_qualities
+
+        return record, self._compress_cigar(ops), (read_start, read_end)
+
+
+    def _adjust_seq_length(
+        self, sequence, qualities, ops, orientation, full_sequence,
+        read_start, read_end,
+    ):
+        """Adjust sequence length and keep its CIGAR/qualities in sync"""
+        sequence = list(sequence)
+        qualities = list(qualities)
+        ops = list(ops)
+
+        def consumes_query(op):
+            return op in (0, 1, 4, 7, 8)  # M, I, S, =, X
+
+        if len(sequence) > self.read_length:
+            excess = len(sequence) - self.read_length
+            del sequence[-excess:]
+            del qualities[-excess:]
+            
+            while excess and ops:
+                op, length = ops[-1]
+                if not consumes_query(op):
+                    ops.pop()
+                elif length <= excess:
+                    excess -= length
+                    ops.pop()
+                else:
+                    ops[-1] = (op, length - excess)
+                    excess = 0
+            
+            while ops and ops[-1][0] == 2:
+                ops.pop()
+
+        elif len(sequence) < self.read_length:
+            to_add = self.read_length - len(sequence)
+            matches = 0
+            softclips = 0
+
+            for _ in range(to_add):
+                if orientation == "forward":
+                    ref_pos = read_end
+                    if ref_pos < len(full_sequence):
+                        sequence.append(str(full_sequence[ref_pos]))
+                        read_end += 1
+                        matches +=1
+                    else:
+                        sequence.append("A")
+                        softclips += 1
+                
+                elif orientation == "reverse":
+                    ref_pos = read_start - 1
+                    if ref_pos >= 0:
+                        sequence.append(str(util.rev_comp(full_sequence[ref_pos])))
+                        read_start -= 1
+                        matches += 1
+                    else:
+                        sequence.append("A")
+                        softclips += 1
+                else:
+                    raise ValueError(f"Unknown orientation: {orientation}")
+                    
+                qualities.append(qualities[-1] if qualities else 0)
+            
+            if matches:
+                ops.append((0, matches)) # M
+            if softclips:
+                ops.append((4, softclips)) # S
+
+        return sequence, qualities, ops, read_start, read_end
+
+    def _compress_cigar(self, ops):
+        """Coalesce adjacent operations: [(0, 1), (0, 2)] -> [(0, 3)]."""
+        return [
+            (op, sum(1 for _ in group))
+            for op, group in groupby(ops, key=lambda item: item[0])
+        ]
