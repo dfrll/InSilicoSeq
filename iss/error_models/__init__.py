@@ -218,15 +218,18 @@ class ErrorModel(object):
         self, sequence, qualities, ops, orientation, full_sequence,
         read_start, read_end,
     ):
-        """Adjust a read to the configured length, keeping qualities and CIGAR in sync.
+        """Adjust a read to the configured length while keeping its sequence,
+        qualities, CIGAR operations, and reference coordinates consistent.
 
-        Truncate excess query bases from the end, or extend the read using bases
-        from the reference. If the reference has no bases available, pad with
-        ``"A"`` and represent those bases as soft clips.
+        Excess query bases are truncated from the end, with the corresponding CIGAR
+        operations removed or shortened. Reference coordinates are updated for removed
+        reference-consuming operations. Short reads are extended with reference bases
+        when available; positions beyond the reference are padded with ``"A"`` and
+        represented as soft clips.
 
         Args:
             sequence: Read bases.
-            qualities: Per-base quality values.
+            qualities: Per-base quality values, one per read base.
             ops: CIGAR operations as ``(operation_code, length)`` pairs.
             orientation: Read orientation, either ``"forward"`` or ``"reverse"``.
             full_sequence: Reference sequence used to extend the read.
@@ -234,8 +237,8 @@ class ErrorModel(object):
             read_end: End coordinate of the read on the reference.
 
         Returns:
-            A tuple containing the adjusted sequence, qualities, CIGAR operations,
-            start coordinate, and end coordinate.
+            A tuple of the adjusted sequence, qualities, CIGAR operations, start
+            coordinate, and end coordinate.
         """
         sequence = list(sequence)
         qualities = list(qualities)
@@ -244,24 +247,55 @@ class ErrorModel(object):
         def consumes_query(op):
             return op in (0, 1, 4, 7, 8)  # M, I, S, =, X
 
+        def consumes_reference(op):
+            return op in (0, 2, 3, 7, 8)  # M, D, N, =, X
+
+        if len(sequence) != len(qualities):
+            raise ValueError("Sequence and qualities must have the same length")
+
         if len(sequence) > self.read_length:
             excess = len(sequence) - self.read_length
             del sequence[-excess:]
             del qualities[-excess:]
 
+            removed_reference = 0
+
+            # remove CIGAR operations from the same end as the trimmed query.
             while excess and ops:
                 op, length = ops[-1]
+
                 if not consumes_query(op):
                     ops.pop()
-                elif length <= excess:
-                    excess -= length
+                    if consumes_reference(op):
+                        removed_reference += length
+                    continue
+
+                removed = min(length, excess)
+                if consumes_reference(op):
+                    removed_reference += removed
+
+                excess -= removed
+                if removed == length:
                     ops.pop()
                 else:
-                    ops[-1] = (op, length - excess)
-                    excess = 0
-            
-            while ops and ops[-1][0] == 2:
-                ops.pop()
+                    ops[-1] = (op, length - removed)
+
+            if excess:
+                raise ValueError(
+                    "CIGAR query length is shorter than the sequence being trimmed"
+                )
+
+            # remove boundary deletions/skips exposed by the trim.
+            while ops and ops[-1][0] in (2, 3):  # D, N
+                _, length = ops.pop()
+                removed_reference += length
+
+            if orientation == "forward":
+                read_end -= removed_reference
+            elif orientation == "reverse":
+                read_start += removed_reference
+            else:
+                raise ValueError(f"Unknown orientation: {orientation}")
 
         elif len(sequence) < self.read_length:
             to_add = self.read_length - len(sequence)
@@ -274,11 +308,11 @@ class ErrorModel(object):
                     if ref_pos < len(full_sequence):
                         sequence.append(str(full_sequence[ref_pos]))
                         read_end += 1
-                        matches +=1
+                        matches += 1
                     else:
                         sequence.append("A")
                         softclips += 1
-                
+
                 elif orientation == "reverse":
                     ref_pos = read_start - 1
                     if ref_pos >= 0:
@@ -290,15 +324,16 @@ class ErrorModel(object):
                         softclips += 1
                 else:
                     raise ValueError(f"Unknown orientation: {orientation}")
-                    
+
                 qualities.append(qualities[-1] if qualities else 0)
-            
+
             if matches:
                 ops.append((0, matches)) # M
             if softclips:
                 ops.append((4, softclips)) # S
 
         return sequence, qualities, ops, read_start, read_end
+
 
     def _compress_cigar(self, ops):
         """Merge adjacent identical CIGAR operations.
