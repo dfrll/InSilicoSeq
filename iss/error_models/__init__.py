@@ -218,7 +218,25 @@ class ErrorModel(object):
         self, sequence, qualities, ops, orientation, full_sequence,
         read_start, read_end,
     ):
-        """Adjust sequence length and keep its CIGAR/qualities in sync"""
+        """Adjust a read to the configured length, keeping qualities and CIGAR in sync.
+
+        Truncate excess query bases from the end, or extend the read using bases
+        from the reference. If the reference has no bases available, pad with
+        ``"A"`` and represent those bases as soft clips.
+
+        Args:
+            sequence: Read bases.
+            qualities: Per-base quality values.
+            ops: CIGAR operations as ``(operation_code, length)`` pairs.
+            orientation: Read orientation, either ``"forward"`` or ``"reverse"``.
+            full_sequence: Reference sequence used to extend the read.
+            read_start: Start coordinate of the read on the reference.
+            read_end: End coordinate of the read on the reference.
+
+        Returns:
+            A tuple containing the adjusted sequence, qualities, CIGAR operations,
+            start coordinate, and end coordinate.
+        """
         sequence = list(sequence)
         qualities = list(qualities)
         ops = list(ops)
@@ -230,7 +248,7 @@ class ErrorModel(object):
             excess = len(sequence) - self.read_length
             del sequence[-excess:]
             del qualities[-excess:]
-            
+
             while excess and ops:
                 op, length = ops[-1]
                 if not consumes_query(op):
@@ -283,8 +301,19 @@ class ErrorModel(object):
         return sequence, qualities, ops, read_start, read_end
 
     def _compress_cigar(self, ops):
-        """Coalesce adjacent operations: [(0, 1), (0, 2)] -> [(0, 3)]."""
-        return [
-            (op, sum(1 for _ in group))
-            for op, group in groupby(ops, key=lambda item: item[0])
-        ]
+        """Merge adjacent identical CIGAR operations.
+
+        Args:
+            ops: CIGAR operations as ``(operation_code, length)`` pairs.
+
+        Returns:
+            A list of ``(operation_code, combined_length)`` pairs.
+        """
+        compressed = []
+        for op, length in ops:
+            if compressed and compressed[-1][0] == op:
+                previous_op, previous_length = compressed[-1]
+                compressed[-1] = (previous_op, previous_length + length)
+            else:
+                compressed.append((op, length))
+        return compressed
