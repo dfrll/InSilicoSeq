@@ -11,6 +11,7 @@ from shutil import copyfileobj
 
 import numpy as np
 from Bio import SeqIO
+import pysam
 
 
 def phred_to_prob(q):
@@ -233,6 +234,34 @@ def concatenate(file_list, output, header=None):
                 with open(file_name, "rb") as f:
                     copyfileobj(f, out_file)
 
+
+def concatenate_sam(file_list, output, header=None):
+    """Combine SAM files, writing a single header."""
+    logger = logging.getLogger(__name__)
+    logger.info("Stitching SAM files together")
+
+    sam_files = [path for path in file_list if path is not None]
+    if not sam_files and header is None:
+        logger.error("Cannot create SAM output without input files or a header")
+        sys.exit(1)
+
+    try:
+        if header is not None:
+            output_header = pysam.AlignmentHeader.from_dict(header)
+        else:
+            # Use the first input file's header
+            with pysam.AlignmentFile(sam_files[0], "r") as first:
+                output_header = first.header
+
+        with pysam.AlignmentFile(output, "w", header=output_header) as out_file:
+            for file_name in sam_files:
+                with pysam.AlignmentFile(file_name, "r") as sam_in:
+                    for record in sam_in.fetch(until_eof=True):
+                        out_file.write(record)
+
+    except (OSError, ValueError) as e:
+        logger.error("Failed to concatenate SAM files: %s", e)
+        sys.exit(1)
 
 def cleanup(file_list):
     """remove temporary files
